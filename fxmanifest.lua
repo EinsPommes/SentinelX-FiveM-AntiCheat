@@ -1,7 +1,7 @@
 fx_version 'cerulean'
 game 'gta5'
 
-author 'SentinelX'
+author 'EinsPommes'
 description 'Fortschrittliches FiveM Anti-Cheat System'
 version '1.0.0'
 

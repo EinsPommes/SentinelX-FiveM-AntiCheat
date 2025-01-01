@@ -27,7 +27,7 @@ AddEventHandler('playerConnecting', function(name, setKickReason, deferrals)
         letztePosition = vector3(0, 0, 0),
         letzteGesundheit = 100,
         fehlgeschlagenePruefungen = 0
-    }
+    }                                                                            
     
     deferrals.done()
 end)
