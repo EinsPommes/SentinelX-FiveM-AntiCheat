@@ -13,7 +13,6 @@ client_scripts {
 -- Server Skripte
 server_scripts {
     'server/*.lua'
-    'server/modules/*.lua'
 }
 
 -- Gemeinsam genutzte Skripte

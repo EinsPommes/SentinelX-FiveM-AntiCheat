@@ -1,15 +1,24 @@
 -- SentinelX Erweiterte Erkennungsmechanismen
 
+-- Utility function: Normalize vector
+local function normalize(vec)
+    local length = math.sqrt(vec.x * vec.x + vec.y * vec.y + vec.z * vec.z)
+    if length > 0 then
+        return vector3(vec.x / length, vec.y / length, vec.z / length)
+    end
+    return vector3(0, 0, 0)
+end
+
 -- Noclip Erkennung
 local function PruefeNoclip()
     local ped = PlayerPedId()
     local position = GetEntityCoords(ped)
     local hoehe = position.z
     
-    -- Prüfe ob Spieler durch Wände oder Boden geht
-    if not IsEntityTouchingGround(ped) and not IsPedFalling(ped) and not IsPedInParachuteFreeFall(ped) then
+    -- Check if player is going through walls or ground
+    if not IsEntityTouchingGround(ped) and not IsPedFalling(ped) and not IsPedInParachuteFreeFall(ped) and not IsPedInAnyVehicle(ped, false) then
         local _, groundZ = GetGroundZFor_3dCoord(position.x, position.y, position.z, false)
-        if math.abs(hoehe - groundZ) > 5.0 then
+        if math.abs(hoehe - groundZ) > SentinelX.Config.Schwellenwerte.NoclipHoehenDifferenz then
             return true
         end
     end
@@ -17,20 +26,40 @@ local function PruefeNoclip()
 end
 
 -- Godmode Erkennung
+-- Improved: Server-side validation is more reliable
+-- This client-side check is limited and should be used carefully
+local godmodeCheckCooldown = 0
 local function PruefeGodmode()
+    local currentTime = GetGameTimer()
+    
+    -- Only check periodically to avoid false positives
+    if currentTime < godmodeCheckCooldown then
+        return false
+    end
+    
     local ped = PlayerPedId()
+    if not DoesEntityExist(ped) then
+        return false
+    end
+    
     local startHealth = GetEntityHealth(ped)
+    local startArmor = GetPedArmour(ped)
     
-    -- Versuche Schaden zuzufügen (unsichtbar für den Spieler)
-    ApplyDamageToPed(ped, 1, false)
-    Wait(50)
-    local endHealth = GetEntityHealth(ped)
+    -- Check if health exceeds maximum allowed
+    if startHealth > SentinelX.Config.Schwellenwerte.MaxGesundheit then
+        return true
+    end
     
-    -- Stelle Gesundheit wieder her
-    SetEntityHealth(ped, startHealth)
+    -- Check if armor exceeds maximum allowed
+    if startArmor > SentinelX.Config.Schwellenwerte.MaxRuestung then
+        return true
+    end
     
-    -- Wenn kein Schaden genommen wurde, könnte Godmode aktiv sein
-    return startHealth == endHealth
+    -- Note: Direct damage testing is unreliable and can cause false positives
+    -- Server-side validation should handle actual godmode detection
+    godmodeCheckCooldown = currentTime + SentinelX.Config.Schwellenwerte.GodmodeTestInterval
+    
+    return false
 end
 
 -- Aimbot Erkennung
@@ -44,9 +73,9 @@ local function PruefeAimbot()
             local startRot = GetGameplayCamRot(2)
             Wait(50)
             local endRot = GetGameplayCamRot(2)
-            local rotSpeed = #(endRot - startRot) / 0.05 -- Rotationsgeschwindigkeit
+            local rotSpeed = #(endRot - startRot) / 0.05 -- Rotation speed
             
-            if rotSpeed > 500.0 then -- Zu schnelle Rotation könnte auf Aimbot hinweisen
+            if rotSpeed > SentinelX.Config.Schwellenwerte.AimbotRotationsGeschwindigkeit then
                 return true
             end
         end
@@ -57,26 +86,47 @@ end
 -- ESP/Wallhack Erkennung
 local function PruefeESP()
     local ped = PlayerPedId()
-    local los = HasEntityClearLosToEntity -- Line of Sight
+    if not DoesEntityExist(ped) then
+        return false
+    end
     
-    -- Prüfe ob Spieler Entities durch Wände sieht
-    local entities = GetGamePool('CPed')
-    for _, entity in ipairs(entities) do
-        if DoesEntityExist(entity) and entity ~= ped then
-            if not los(ped, entity, 17) then -- 17 = Includes all objects
-                -- Hier könnte man prüfen ob der Spieler trotzdem auf verdeckte Entities reagiert
-                local targetRot = GetEntityRotation(ped, 2)
+    -- Check if player is aiming at entities through walls
+    local pedPos = GetEntityCoords(ped)
+    local nearbyPeds = {}
+    
+    -- Get nearby peds (more efficient than GetGamePool)
+    local handle, entity = FindFirstPed()
+    if handle ~= -1 then
+        repeat
+            if DoesEntityExist(entity) and entity ~= ped and IsPedAPlayer(entity) == false then
                 local entityPos = GetEntityCoords(entity)
-                local pedPos = GetEntityCoords(ped)
-                local direction = normalize(entityPos - pedPos)
+                local distance = #(pedPos - entityPos)
                 
-                -- Wenn Spieler auf verdeckte Entities zielt, könnte ESP aktiv sein
-                if IsPedFacingEntity(ped, entity, 30.0) then
-                    return true
+                -- Only check nearby entities (within reasonable range)
+                if distance < 50.0 then
+                    table.insert(nearbyPeds, entity)
+                end
+            end
+            handle, entity = FindNextPed(handle)
+        until not handle
+        EndFindPed(handle)
+    end
+    
+    -- Check if player is facing entities without line of sight
+    for _, entity in ipairs(nearbyPeds) do
+        if DoesEntityExist(entity) then
+            if not HasEntityClearLosToEntity(ped, entity, 17) then -- 17 = Includes all objects
+                -- Check if player is facing the hidden entity
+                if IsPedFacingEntity(ped, entity, SentinelX.Config.Schwellenwerte.ESPWinkel) then
+                    -- Additional check: is player aiming at this entity?
+                    if IsPedShooting(ped) then
+                        return true
+                    end
                 end
             end
         end
     end
+    
     return false
 end
 
@@ -97,37 +147,66 @@ local function PruefeTeleport()
     return false
 end
 
--- Hauptprüfschleife
-Citizen.CreateThread(function()
-    while true do
-        Citizen.Wait(1000)
-        
-        -- Noclip Erkennung
-        if PruefeNoclip() then
-            TriggerServerEvent('sentinelx:cheatDetected', 'noclip')
+-- Main detection loop with separate threads for each check type
+-- Noclip detection thread
+if SentinelX.Config.ErweitertePruefungen.NoclipErkennung then
+    Citizen.CreateThread(function()
+        while true do
+            Citizen.Wait(SentinelX.Config.ErweitertePruefungen.NoclipInterval)
+            if PruefeNoclip() then
+                TriggerServerEvent('sentinelx:cheatDetected', 'noclip')
+            end
         end
-        
-        -- Godmode Erkennung
-        if PruefeGodmode() then
-            TriggerServerEvent('sentinelx:cheatDetected', 'godmode')
+    end)
+end
+
+-- Godmode detection thread
+if SentinelX.Config.ErweitertePruefungen.GodmodeErkennung then
+    Citizen.CreateThread(function()
+        while true do
+            Citizen.Wait(SentinelX.Config.ErweitertePruefungen.GodmodeInterval)
+            if PruefeGodmode() then
+                TriggerServerEvent('sentinelx:cheatDetected', 'godmode')
+            end
         end
-        
-        -- Aimbot Erkennung
-        if PruefeAimbot() then
-            TriggerServerEvent('sentinelx:cheatDetected', 'aimbot')
+    end)
+end
+
+-- Aimbot detection thread
+if SentinelX.Config.ErweitertePruefungen.AimbotErkennung then
+    Citizen.CreateThread(function()
+        while true do
+            Citizen.Wait(SentinelX.Config.ErweitertePruefungen.AimbotInterval)
+            if PruefeAimbot() then
+                TriggerServerEvent('sentinelx:cheatDetected', 'aimbot')
+            end
         end
-        
-        -- ESP/Wallhack Erkennung
-        if PruefeESP() then
-            TriggerServerEvent('sentinelx:cheatDetected', 'esp')
+    end)
+end
+
+-- ESP/Wallhack detection thread
+if SentinelX.Config.ErweitertePruefungen.ESPErkennung then
+    Citizen.CreateThread(function()
+        while true do
+            Citizen.Wait(SentinelX.Config.ErweitertePruefungen.ESPInterval)
+            if PruefeESP() then
+                TriggerServerEvent('sentinelx:cheatDetected', 'esp')
+            end
         end
-        
-        -- Teleport Erkennung
-        if PruefeTeleport() then
-            TriggerServerEvent('sentinelx:cheatDetected', 'teleport')
+    end)
+end
+
+-- Teleport detection thread
+if SentinelX.Config.ErweitertePruefungen.TeleportErkennung then
+    Citizen.CreateThread(function()
+        while true do
+            Citizen.Wait(SentinelX.Config.ErweitertePruefungen.TeleportInterval)
+            if PruefeTeleport() then
+                TriggerServerEvent('sentinelx:cheatDetected', 'teleport')
+            end
         end
-    end
-end)
+    end)
+end
 
 -- Screenshot-System für Beweissicherung
 RegisterNetEvent('sentinelx:requestScreenshot')
